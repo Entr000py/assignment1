@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import os
-from typing import IO, Any, BinaryIO
+from typing import IO, Any, BinaryIO, List, Dict, Tuple
 from collections.abc import Iterable
 from jaxtyping import Float, Int
 
 import numpy.typing as npt
 import torch
 from torch import Tensor
+import collections
+import regex as re
 
 
 def run_linear(
@@ -562,31 +564,108 @@ def get_tokenizer(
     raise NotImplementedError
 
 
+
+import heapq
+
 def run_train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
     special_tokens: list[str],
-    **kwargs,
-) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-    """Given the path to an input corpus, run train a BPE tokenizer and
-    output its vocabulary and merges.
-
-    Args:
-        input_path (str | os.PathLike): Path to BPE tokenizer training data.
-        vocab_size (int): Total number of items in the tokenizer's vocabulary (including special tokens).
-        special_tokens (list[str]): A list of string special tokens to be added to the tokenizer vocabulary.
-            These strings will never be split into multiple tokens, and will always be
-            kept as a single token. If these special tokens occur in the `input_path`,
-            they are treated as any other string.
-
-    Returns:
-        tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
-            vocab:
-                The trained tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
-                to bytes (token bytes)
-            merges:
-                BPE merges. Each list item is a tuple of bytes (<token1>, <token2>),
-                representing that <token1> was merged with <token2>.
-                Merges are ordered by order of creation.
+    ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     """
-    raise NotImplementedError
+    给定输入语料库的路径，训练一个BPE分词器并输出其词汇表和合并规则。
+    优化版本：使用高效的数据结构和算法，确保与参考实现完全一致。
+    """
+    # 1. 初始化词汇表
+    vocab = {bytes([i]): i for i in range(256)}
+    for i, token in enumerate(special_tokens):
+        vocab[token.encode("utf-8")] = 256 + i
+
+    # 2. 预分词，使用正则表达式解析文本
+    special_tokens_pattern = "|".join(re.escape(s) for s in special_tokens)
+    gpt2_pattern = re.compile(
+        r"'(?:s|t|re|ve|m|ll|d)|" + (special_tokens_pattern and (special_tokens_pattern + r"|")) + r" ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
+        re.UNICODE
+    )
+
+    with open(input_path, 'r', encoding='utf-8') as f:
+        text = f.read()
+
+    # 3. 统计单词频率
+    special_tokens_bytes = {s.encode("utf-8") for s in special_tokens}
+    word_freqs = collections.defaultdict(int)
+    for word in gpt2_pattern.findall(text):
+        b_word = word.encode("utf-8")
+        if b_word in special_tokens_bytes:
+            vocab[b_word] = len(vocab)
+            continue
+        word_freqs[b_word] += 1
+    
+    # 4. 将每个单词分解为字节序列
+    splits = {word: [bytes([b]) for b in word] for word in word_freqs.keys()}
+
+    # 5. 计算初始的词元对频率
+    pair_freqs = collections.defaultdict(int)
+    for word, freq in word_freqs.items():
+        split = splits[word]
+        for i in range(len(split) - 1):
+            pair = (split[i], split[i+1])
+            pair_freqs[pair] += freq
+
+    # 6. 迭代合并
+    merges = []
+    num_merges = vocab_size - len(vocab)
+    
+    for _ in range(num_merges):
+        if not pair_freqs:
+            break
+        
+        # 7. 找到频率最高的词元对 (平局决胜：频率最高，字典序最小)
+        best_pair = max(pair_freqs, key=lambda p: (pair_freqs[p], p[0], p[1]))
+        if pair_freqs[best_pair] == 0:
+            break
+        
+        # 8. 将新生成的token加入词汇表和合并列表
+        merges.append(best_pair)
+        new_token = best_pair[0] + best_pair[1]
+        vocab[new_token] = len(vocab)
+
+        # 9. 增量更新
+        for word in list(word_freqs.keys()):
+            if len(splits[word]) < 2:
+                continue
+
+            # 新的split列表
+            new_split = []
+            current_split = splits[word]
+            i = 0
+            while i < len(current_split):
+                if i < len(current_split) - 1 and (current_split[i], current_split[i+1]) == best_pair:
+                    new_split.append(new_token)
+                    i += 2
+                else:
+                    new_split.append(current_split[i])
+                    i += 1
+            
+            # 如果发生了合并
+            if len(new_split) != len(current_split):
+                freq = word_freqs[word]
+                # 从旧的split中减去频率
+                for j in range(len(current_split) - 1):
+                    pair = (current_split[j], current_split[j+1])
+                    pair_freqs[pair] -= freq
+                
+                # 更新split
+                splits[word] = new_split
+
+                # 向新的split中添加频率
+                for j in range(len(new_split) - 1):
+                    pair = (new_split[j], new_split[j+1])
+                    pair_freqs[pair] = pair_freqs.get(pair, 0) + freq
+
+        # 10. 清理频率为0的词元对
+        pair_freqs = {p: f for p, f in pair_freqs.items() if f > 0}
+    
+    # 11. 构造最终的词汇表 (id -> token)
+    final_vocab = {v: k for k, v in vocab.items()}
+    return final_vocab, merges
