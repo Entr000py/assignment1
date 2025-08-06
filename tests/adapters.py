@@ -604,6 +604,13 @@ def run_train_bpe(
     # 4. 将每个单词分解为字节序列
     splits = {word: [bytes([b]) for b in word] for word in word_freqs.keys()}
 
+    # 倒排索引：pair -> set(words)
+    pair2words = collections.defaultdict(set)
+    for word, split in splits.items():
+        for i in range(len(split) - 1):
+            pair = (split[i], split[i+1])
+            pair2words[pair].add(word)
+
     # 5. 计算初始的词元对频率
     pair_freqs = collections.defaultdict(int)
     for word, freq in word_freqs.items():
@@ -612,30 +619,34 @@ def run_train_bpe(
             pair = (split[i], split[i+1])
             pair_freqs[pair] += freq
 
+    # 构建最大堆
+    heap = [(-freq, pair) for pair, freq in pair_freqs.items()]
+    heapq.heapify(heap)
     # 6. 迭代合并
     merges = []
     num_merges = vocab_size - len(vocab)
-    
     for _ in range(num_merges):
-        if not pair_freqs:
+        if not heap:
             break
-        
-        # 7. 找到频率最高的词元对 (平局决胜：频率最高，字典序最小)
-        best_pair = max(pair_freqs, key=lambda p: (pair_freqs[p], p[0], p[1]))
-        if pair_freqs[best_pair] == 0:
-            break
-        
-        # 8. 将新生成的token加入词汇表和合并列表
+
+        # 取最大频率的 pair，跳过过期的
+        while heap:
+            neg_freq, best_pair = heapq.heappop(heap)
+            if pair_freqs.get(best_pair, 0) == -neg_freq and pair_freqs[best_pair] > 0:
+                break
+        else:
+            break  # 堆空
+
+        # ...后续合并逻辑不变...
         merges.append(best_pair)
         new_token = best_pair[0] + best_pair[1]
         vocab[new_token] = len(vocab)
 
-        # 9. 增量更新
-        for word in list(word_freqs.keys()):
+        # 增量更新 splits 和 pair_freqs（此处逻辑和你原来一致）
+        affected_words = pair2words.get(best_pair, set()).copy()
+        for word in affected_words:
             if len(splits[word]) < 2:
                 continue
-
-            # 新的split列表
             new_split = []
             current_split = splits[word]
             i = 0
@@ -646,26 +657,21 @@ def run_train_bpe(
                 else:
                     new_split.append(current_split[i])
                     i += 1
-            
-            # 如果发生了合并
             if len(new_split) != len(current_split):
                 freq = word_freqs[word]
-                # 从旧的split中减去频率
+                # 移除旧 pair
                 for j in range(len(current_split) - 1):
                     pair = (current_split[j], current_split[j+1])
+                    pair2words[pair].discard(word)
                     pair_freqs[pair] -= freq
-                
-                # 更新split
                 splits[word] = new_split
-
-                # 向新的split中添加频率
+                # 添加新 pair
                 for j in range(len(new_split) - 1):
                     pair = (new_split[j], new_split[j+1])
+                    pair2words[pair].add(word)
                     pair_freqs[pair] = pair_freqs.get(pair, 0) + freq
+                    heapq.heappush(heap, (-pair_freqs[pair], pair))
 
-        # 10. 清理频率为0的词元对
-        pair_freqs = {p: f for p, f in pair_freqs.items() if f > 0}
-    
     # 11. 构造最终的词汇表 (id -> token)
     final_vocab = {v: k for k, v in vocab.items()}
     return final_vocab, merges
